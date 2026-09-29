@@ -1,12 +1,13 @@
 // Offline shell: app files are cached; the budget data itself always comes from GitHub
 // (the app keeps its own encrypted copy for offline viewing).
-const CACHE = 'coinmaster-1.0.0';
+const CACHE = 'coinmaster-1.0.1';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'engine.js', 'crypto.js', 'github.js', 'ui.js', 'charts.js',
   'txn-ui.js', 'view-budget.js', 'view-update.js', 'view-activity.js', 'view-settings.js', 'view-setup.js', 'xlsx-lite.js',
   'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // 'reload' skips the browser's HTTP cache, so a new version never caches old files
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim()));

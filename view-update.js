@@ -32,13 +32,14 @@ async function runImport(fileList) {
   if (!fileList.length) return;
   app.busy = true; render();
   const files = [], problems = [];
+  const track = { learned: [], newAccts: [] }; // remembered with the import, so undoing it forgets them too
   try {
     for (const f of fileList) {
       try {
         const rows = await readSpreadsheet(await f.arrayBuffer(), f.name);
         const records = E.parseSheetRows(rows);
         let accountId = E.detectAccount(app.state, f.name, records);
-        if (!accountId) accountId = await askAccount(f.name, records);
+        if (!accountId) accountId = await askAccount(f.name, records, track);
         if (!accountId) { problems.push(`${f.name}: skipped`); continue; }
         files.push({ name: f.name, accountId, records });
       } catch (e) {
@@ -47,9 +48,10 @@ async function runImport(fileList) {
     }
     if (files.length) {
       const plan = E.planImport(app.state, files);
+      const batchId = E.newId('imp');
       let res;
-      mutate(s => { res = E.applyImport(s, plan, { batchId: E.newId('imp') }); }, { label: null, message: `Import: ${plan.fresh.length} new` });
-      app.lastImport = { at: new Date().toISOString(), res: { added: res.added, known: res.known, review: res.review }, files: plan.files, problems };
+      mutate(s => { res = E.applyImport(s, plan, { batchId, ...track }); }, { label: null, message: `Import: ${plan.fresh.length} new` });
+      app.lastImport = { id: batchId, at: new Date().toISOString(), res: { added: res.added, known: res.known, review: res.review }, files: plan.files, problems };
       if (res.added) publishNow();
       window.scrollTo({ top: 0 });
     } else if (problems.length) {
@@ -60,14 +62,17 @@ async function runImport(fileList) {
   }
 }
 
-function askAccount(fileName, records) {
+function askAccount(fileName, records, track) {
   return new Promise(resolve => {
     let done = false;
-    const idPart = fileName.split(/[_\s(]/)[0];
+    const idPart = E.fileIdPart(fileName);
     const cardLike = records.length && records.every(r => !r.partner && !r.iban);
     const remember = (id) => {
       done = true; sheet.close();
-      mutate(s => { const a = s.accounts.find(x => x.id === id); if (idPart && idPart.length >= 4 && !a.ids.includes(idPart)) a.ids.push(idPart); }, { label: null });
+      mutate(s => {
+        const a = s.accounts.find(x => x.id === id);
+        if (idPart && idPart.length >= 4 && !a.ids.includes(idPart)) { a.ids.push(idPart); track.learned.push({ acct: id, id: idPart }); }
+      }, { label: null });
       resolve(id);
     };
     const nameIn = h('input', { type: 'text', placeholder: cardLike ? 'e.g. Mastercard …1234' : 'e.g. Savings account' });
@@ -82,6 +87,7 @@ function askAccount(fileName, records) {
             const name = nameIn.value.trim(); if (!name) { nameIn.focus(); return; }
             const id = E.newId('acc');
             mutate(s => { s.accounts.push({ id, name, kind: cardLike ? 'card' : 'giro', ids: [idPart].filter(Boolean), anchor: { cents: 0, note: 'Added in the app: set the balance under Accounts' } }); }, { label: null });
+            track.newAccts.push(id);
             done = true; sheet.close(); resolve(id);
           } }, 'Add account'))),
       onClose: () => { if (!done) resolve(null); },
@@ -91,11 +97,63 @@ function askAccount(fileName, records) {
 
 function summaryCard(li) {
   const { res, files, problems } = li;
+  const canUndo = li.id && undoable(li.id);
   return h('section.card.summary',
     h('div.section-head', h('h2', res.added ? 'Imported' : 'Nothing new'), h('button.icon-btn', { type: 'button', 'aria-label': 'Dismiss', onclick: () => { app.lastImport = null; render(); } }, icon('x'))),
     h('p.big-line', h('span', h('strong', res.added), ' new'), h('span', h('strong', res.known), ' already known'), h('span', h('strong', res.review), ' to review')),
     files.map(f => h('p.file-line', icon('file', 'sm'), h('span', `${accountName(f.accountId)} · ${f.rows} rows`), h('span.muted.ellipsis', f.name))),
-    (problems || []).map(p => h('p.notice.warn', p)));
+    (problems || []).map(p => h('p.notice.warn', p)),
+    canUndo ? h('button.link.small', { type: 'button', onclick: () => confirmUndo(li.id) }, icon('undo', 'sm'), 'Wrong files? Undo this import') : null);
+}
+
+// ───────────────────────── undo an import ─────────────────────────
+
+// (guarded: during an app update the page may briefly run the previous engine)
+const undoable = (id) => typeof E.undoableImport === 'function' && E.undoableImport(app.state, id);
+const when = (iso) => new Date(iso).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+/** ['2026-08', '2026-09'] → "August and September 2026" */
+function monthsText(ms) {
+  const list = (names) => names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names.at(-1)}` : names[0];
+  if (ms.every(m => m.slice(0, 4) === ms[0].slice(0, 4))) return `${list(ms.map(m => E.monthLabel(m, true).split(' ')[0]))} ${ms[0].slice(0, 4)}`;
+  return list(ms.map(m => E.monthLabel(m, true)));
+}
+
+function confirmUndo(batchId) {
+  const p = E.undoPreview(app.state, batchId, E.todayISO());
+  if (!p) { toast('Nothing left to undo in that import'); render(); return; }
+  const n = p.removed;
+  const monthName = E.monthLabel(p.month, true).split(' ')[0];
+  const sheet = openSheet({
+    title: 'Undo this import?',
+    subtitle: `Imported ${when(p.imp.at)}`,
+    body: h('div.stack-sm',
+      (p.imp.files || []).map(f => h('p.file-line', icon('file', 'sm'), h('span', `${accountName(f.accountId)} · ${f.rows} rows`), h('span.muted.ellipsis', f.name))),
+      h('p', `Removes the ${n} transaction${n === 1 ? '' : 's'} it added` + (p.months.length
+        ? ` (${monthsText(p.months)}). Months and carry-over are recalculated.`
+        : `. ${n === 1 ? 'It did not count' : 'None of them counted'} in any month, so your figures stay the same.`)),
+      h('p', p.filed ? `You had already filed ${p.filed} of them; those decisions go too. Your rules stay.` : 'Your rules stay.'),
+      p.moneyBefore !== null && p.moneyAfter !== null && p.moneyBefore !== p.moneyAfter
+        ? h('p', `Money left in ${monthName}: `, h('strong', fmt(p.moneyBefore)), ' → ', h('strong', fmt(p.moneyAfter))) : null,
+      p.later
+        ? h('p.notice.warn', icon('alert', 'sm'), `You updated again after this${p.later > 1 ? ` (${p.later} times)` : ''}; those updates stay. Afterwards, import the right files: anything missing is added back, the rest is skipped.`)
+        : h('p.muted', 'Afterwards, import the right files as usual: these transactions are then treated as new.')),
+    footer: [
+      h('button.btn.ghost', { type: 'button', onclick: () => sheet.close() }, 'Cancel'),
+      h('button.btn.danger', { type: 'button', onclick: () => { sheet.close(); undoImportNow(batchId); } }, 'Undo import'),
+    ],
+  });
+}
+
+function undoImportNow(batchId) {
+  if (!undoable(batchId)) return;
+  let res = null;
+  mutate(s => { res = E.undoImport(s, batchId); }, { label: null, message: 'Undo import' });
+  if (!res) return;
+  if (app.lastImport && app.lastImport.id === batchId) app.lastImport = null;
+  render();
+  publishNow();
+  toast(`Import undone: ${res.removed} transaction${res.removed === 1 ? '' : 's'} removed`, { actions: [['Undo', () => undoLast()]], ms: 8000 });
 }
 
 // ───────────────────────── balance check ─────────────────────────
@@ -255,9 +313,20 @@ function reviewItem(t, selecting, sel) {
 }
 
 function historyCard() {
-  const imps = (app.state.imports || []).slice(-5).reverse();
-  if (!imps.length) return null;
+  const st = app.state;
+  const items = [...(st.imports || []), ...(st.undoneImports || []).map(u => ({ ...u, isUndone: true }))]
+    .sort((a, b) => b.at.localeCompare(a.at)).slice(0, 6);
+  if (!items.length) return null;
+  const anyUndoable = items.some(i => !i.isUndone && undoable(i.id));
+  const accounts = (i) => [...new Set((i.files || []).map(f => st.accounts.some(a => a.id === f.accountId) ? accountName(f.accountId) : 'other account'))].join(' + ');
   return h('section.card',
     h('h3', 'Recent updates'),
-    h('ul.plain', imps.map(i => h('li', h('span', new Date(i.at).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })), h('span.muted', `${i.added} new · ${i.known} known · ${i.review} to review`)))));
+    h('ul.plain', items.map(i => h('li',
+      h('div.grow',
+        h('span.block', when(i.at), i.isUndone ? h('span.pill', 'undone') : null),
+        h('span.muted.small.block', [accounts(i), i.isUndone ? `${i.removed} removed on ${when(i.undone)}` : `${i.added} new · ${i.known} known`].filter(Boolean).join(' · '))),
+      !i.isUndone && undoable(i.id)
+        ? h('button.link.small', { type: 'button', 'aria-label': `Undo the import of ${when(i.at)}`, onclick: () => confirmUndo(i.id) }, icon('undo', 'sm'), 'Undo')
+        : null))),
+    anyUndoable ? h('p.muted.small', 'Imported the wrong files? Undo that import, then import the right ones.') : null);
 }

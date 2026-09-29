@@ -373,11 +373,30 @@ export function categorize(state, t, rules = sortedRules(state)) {
 
 // ───────────────────────── import ─────────────────────────
 
-/** Count stored transactions per fingerprint. */
+/**
+ * Count stored transactions per fingerprint (the real number, so a removed or undone
+ * occurrence of identical twins can come back with the next export).
+ */
 export function storedCounts(state) {
   const m = new Map();
-  for (const t of state.txns) m.set(t.fp, Math.max(m.get(t.fp) || 0, t.occ || 1));
+  for (const t of state.txns) m.set(t.fp, (m.get(t.fp) || 0) + 1);
   return m;
+}
+
+/** Occurrence numbers already taken per fingerprint (ids stay unique when twins come back). */
+function takenOccurrences(state) {
+  const m = new Map();
+  for (const t of state.txns) {
+    let s = m.get(t.fp);
+    if (!s) m.set(t.fp, s = new Set());
+    s.add(t.occ || 1);
+  }
+  return m;
+}
+
+/** "AT12…_2026-09-01_2026-09-28.xlsx" → "AT12…": the part of a file name that identifies the account. */
+export function fileIdPart(name) {
+  return String(name || '').split(/[_\s(]/)[0];
 }
 
 function tokens(s) {
@@ -422,13 +441,18 @@ export function planImport(state, files) {
   }
 
   const fresh = [], seenFps = new Set();
+  const taken = takenOccurrences(state);
   let known = 0;
   for (const [accountId, acc] of perAccount) {
     for (const [fp, e] of acc) {
       seenFps.add(fp);
       const have = counts.get(fp) || 0;
       known += Math.min(have, e.count);
-      for (let occ = have + 1; occ <= e.count; occ++) {
+      const used = taken.get(fp) || new Set();
+      for (let k = have; k < e.count; k++) {
+        let occ = 1;
+        while (used.has(occ)) occ++;
+        used.add(occ);
         fresh.push({ ...e.fields, fp, occ, id: occ > 1 ? `${fp}-${occ}` : fp, isTwin: occ > 1 || e.count > 1 });
       }
     }
@@ -452,11 +476,25 @@ export function addDays(iso, n) {
   return d.toISOString().slice(0, 10);
 }
 
+/** File a transaction that has no decision yet: rules, then the before-the-switch check, then loans. */
+function fileNew(state, t, rules) {
+  Object.assign(t, categorize(state, t, rules));
+  const acc = state.accounts.find(a => a.id === t.src);
+  if (acc && acc.anchor && acc.anchor.date && t.date <= acc.anchor.date) {
+    // Already inside the start balance (Coin Master era): keep for reference, count nowhere.
+    Object.assign(t, { type: 'ignore', cat: null, a: 1, rev: 1, pre: 1, hint: `Dated before the switch (${acc.anchor.date}): Coin Master already counted it, so it is ignored. Remove it if it is a duplicate.` });
+  }
+  if (t.type === 'loan') ensureLoan(state, t);
+  return t;
+}
+
 /**
  * Commit a planned import. Every new transaction is categorised once; duplicates the owner
  * confirmed (skipDup) are dropped. Returns a summary.
+ * learned / newAccts: file-name mappings and accounts created while reading these files
+ * (so undoing the import can forget them too).
  */
-export function applyImport(state, plan, { batchId, at = new Date().toISOString(), skip = new Set() } = {}) {
+export function applyImport(state, plan, { batchId, at = new Date().toISOString(), skip = new Set(), learned = [], newAccts = [] } = {}) {
   const rules = sortedRules(state);
   const added = [];
   for (const n of plan.fresh) {
@@ -467,14 +505,8 @@ export function applyImport(state, plan, { batchId, at = new Date().toISOString(
       cp: n.cp || '', purpose: n.purpose || '', iban: n.iban || '', acct: n.acct || '', bank: n.bank || '',
       batch: batchId, a: 0,
     };
-    Object.assign(t, categorize(state, t, rules));
-    const acc = state.accounts.find(a => a.id === t.src);
-    if (acc && acc.anchor && acc.anchor.date && t.date <= acc.anchor.date) {
-      // Already inside the start balance (Coin Master era): keep for reference, count nowhere.
-      Object.assign(t, { type: 'ignore', cat: null, a: 1, rev: 1, pre: 1, hint: `Dated before the switch (${acc.anchor.date}): Coin Master already counted it, so it is ignored. Remove it if it is a duplicate.` });
-    }
+    fileNew(state, t, rules);
     if (n.dupOf) { t.rev = 1; t.dupOf = n.dupOf; t.hint = 'Possible duplicate of an earlier entry'; }
-    if (t.type === 'loan') ensureLoan(state, t);
     state.txns.push(t);
     added.push(t);
   }
@@ -484,17 +516,121 @@ export function applyImport(state, plan, { batchId, at = new Date().toISOString(
     if (card && card.manual) addAutoPayment(state, t, card, batchId);
   }
   // A real card export replaces provisional auto-payments for that card.
+  const replaced = [], manualOff = [];
   for (const t of added.filter(x => x.type === 'settle' && accountKind(state, x.src) === 'card' && x.amt > 0)) {
     const auto = state.txns.find(a => a.auto && a.src === t.src && a.amt === t.amt && dayDiff(a.date, t.date) <= 14);
-    if (auto) state.txns = state.txns.filter(a => a !== auto);
+    if (auto) {
+      state.txns = state.txns.filter(a => a !== auto);
+      if (auto.batch !== batchId) replaced.push(auto);
+    }
     const acc = state.accounts.find(a => a.id === t.src);
-    if (acc) acc.manual = false;
+    if (acc) {
+      if (acc.manual && !manualOff.includes(acc.id)) manualOff.push(acc.id);
+      acc.manual = false;
+    }
   }
   const review = added.filter(t => t.rev).length;
   state.imports = state.imports || [];
-  state.imports.push({ id: batchId, at, files: plan.files, added: added.length, known: plan.known, review });
+  const rec = { id: batchId, at, files: plan.files, added: added.length, known: plan.known, review };
+  if (replaced.length) rec.replaced = replaced;
+  if (manualOff.length) rec.manualOff = manualOff;
+  if (learned.length) rec.learned = learned;
+  if (newAccts.length) rec.newAccts = newAccts;
+  state.imports.push(rec);
   touch(state);
   return { added: added.length, known: plan.known, review, txns: added };
+}
+
+// ───────────────────────── undoing an import ─────────────────────────
+
+/** Imports that can still be undone (they added transactions that are still there). */
+export function undoableImport(state, batchId) {
+  if (!batchId || batchId === 'coinmaster' || batchId === 'manual') return false;
+  if (!(state.imports || []).some(i => i.id === batchId)) return false;
+  return state.txns.some(t => t.batch === batchId && !t.auto && !t.arch);
+}
+
+/**
+ * Take an import back as if it never happened: everything it added goes (with any decisions
+ * made on those rows), its fingerprints are forgotten so the right files import cleanly, and
+ * months and carry-over recalculate from what is left. Rules, manual entries and later
+ * imports stay. Returns { removed, filed, months } or null when there is nothing to undo.
+ */
+export function undoImport(state, batchId, at = new Date().toISOString()) {
+  if (!undoableImport(state, batchId)) return null;
+  const imp = state.imports.find(i => i.id === batchId);
+  const gone = state.txns.filter(t => t.batch === batchId && !t.arch);
+  const goneIds = new Set(gone.map(t => t.id));
+  const rows = gone.filter(t => !t.auto);
+  const months = [...new Set(rows.filter(isCounted).map(t => t.bm).filter(Boolean))].sort();
+  const filed = rows.filter(t => t.man).length;
+  const loanIds = new Set(gone.map(t => t.loan).filter(Boolean));
+  state.txns = state.txns.filter(t => !goneIds.has(t.id));
+
+  // Card bills: automatic card payments this import had replaced come back, if their
+  // current-account debit is still there; cards it switched to "has an export" switch back.
+  for (const id of imp.manualOff || []) {
+    const acc = state.accounts.find(a => a.id === id);
+    if (acc) acc.manual = true;
+  }
+  for (const auto of imp.replaced || []) {
+    const giroId = String(auto.id).replace(/^auto-/, '');
+    if (state.txns.some(t => t.id === auto.id) || !state.txns.some(t => t.id === giroId)) continue;
+    const covered = state.txns.some(t => t.src === auto.src && t.type === 'settle' && t.amt === auto.amt && dayDiff(t.date, auto.date) <= 14);
+    if (!covered) state.txns.push(auto);
+  }
+
+  // Loans that only existed through these rows
+  if (state.loans) state.loans = state.loans.filter(L => !loanIds.has(L.id) || state.txns.some(t => t.loan === L.id));
+
+  // Rows of other imports flagged as "possible duplicate" of a removed row are ordinary again
+  const orphans = state.txns.filter(t => t.dupOf && goneIds.has(t.dupOf));
+  if (orphans.length) {
+    const rules = sortedRules(state);
+    for (const t of orphans) {
+      delete t.dupOf;
+      if (t.man) continue;
+      if (t.pre) { delete t.pre; t.a = 0; }
+      fileNew(state, t, rules);
+    }
+  }
+
+  // File-name → account mappings learned while reading these files, and accounts created for
+  // them, are forgotten unless something else still uses them.
+  const later = state.imports.filter(i => i.id !== batchId && i.at >= imp.at);
+  for (const L of imp.learned || []) {
+    const acc = state.accounts.find(a => a.id === L.acct);
+    const stillUsed = later.some(i => (i.files || []).some(f => f.accountId === L.acct && fileIdPart(f.name) === L.id));
+    if (acc && !stillUsed) acc.ids = (acc.ids || []).filter(x => x !== L.id);
+  }
+  for (const id of imp.newAccts || []) {
+    const acc = state.accounts.find(a => a.id === id);
+    if (!acc || state.txns.some(t => t.src === id) || (acc.anchor && acc.anchor.cents)) continue;
+    state.accounts = state.accounts.filter(a => a.id !== id);
+    if (state.checks) state.checks = state.checks.filter(c => c.acct !== id);
+  }
+
+  // The import leaves the list of updates; a short note of it is kept.
+  state.imports = state.imports.filter(i => i.id !== batchId);
+  const { id, files, added, known, review } = imp;
+  state.undoneImports = [...(state.undoneImports || []), { id, at: imp.at, files, added, known, review, undone: at, removed: rows.length }].slice(-10);
+  touch(state);
+  return { removed: rows.length, filed, months };
+}
+
+/** What undoing would change, for the confirmation: rows, filed ones, months, later imports, money left. */
+export function undoPreview(state, batchId, today = todayISO()) {
+  if (!undoableImport(state, batchId)) return null;
+  const imp = state.imports.find(i => i.id === batchId);
+  const after = structuredClone(state);
+  const res = undoImport(after, batchId);
+  const cur = ym(today) < state.settings.startMonth ? state.settings.startMonth : ym(today);
+  const before = computeAll(state, today).get(cur), then = computeAll(after, today).get(cur);
+  return {
+    ...res, imp, month: cur,
+    later: state.imports.filter(i => i.id !== batchId && i.at >= imp.at).length,
+    moneyBefore: before ? before.closing : null, moneyAfter: then ? then.closing : null,
+  };
 }
 
 export function accountKind(state, id) {

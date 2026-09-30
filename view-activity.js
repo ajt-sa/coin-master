@@ -19,7 +19,8 @@ function matches(t, filter, q) {
   if (filter.startsWith('src:') && t.src !== filter.slice(4)) return false;
   if (filter.startsWith('cat:') && t.cat !== filter.slice(4)) return false;
   if (q) {
-    const hay = E.norm(`${t.cp} ${t.purpose} ${t.note || ''} ${t.tag || ''} ${(t.amt / 100).toFixed(2)} ${fmt(t.amt)}`);
+    const shownAs = typeof E.displayName === 'function' ? E.displayName(app.state, t) || '' : '';
+    const hay = E.norm(`${shownAs} ${t.cp} ${t.purpose} ${t.note || ''} ${t.tag || ''} ${(t.amt / 100).toFixed(2)} ${fmt(t.amt)}`);
     if (!E.norm(q).split(' ').every(w => hay.includes(w))) return false;
   }
   return true;

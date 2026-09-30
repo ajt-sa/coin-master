@@ -407,7 +407,7 @@ function reviewItem(t, selecting, sel) {
   return h('li.ritem', { class: sel.has(t.id) ? 'selected' : '' },
     selecting ? h('input.sel', { type: 'checkbox', checked: sel.has(t.id), 'aria-label': 'Select', onchange: (e) => { if (e.target.checked) sel.add(t.id); else sel.delete(t.id); render(); } }) : null,
     h('button.ritem-main', { type: 'button', onclick: () => selecting ? (sel.has(t.id) ? sel.delete(t.id) : sel.add(t.id), render()) : openTxn(t.id) },
-      h('span.ritem-top', h('span.tx-title', E.describeTxn(t)), h('span.tx-amt', { class: t.amt > 0 ? 'pos' : '' }, fmt(t.amt, { sign: true }))),
+      h('span.ritem-top', h('span.tx-title', E.describeTxn(t, app.state)), h('span.tx-amt', { class: t.amt > 0 ? 'pos' : '' }, fmt(t.amt, { sign: true }))),
       h('span.tx-meta', `${accountName(t.src)} · ${shortDate(t.date)}${t.bm !== E.ym(t.date) ? ` · counts in ${E.monthLabel(t.bm)}` : ''}`),
       t.purpose ? h('span.tx-purpose', t.purpose) : null,
       h('span.flag.warn', icon('alert', 'sm'), t.dupOf ? 'Same amount and date as an earlier entry' : (t.hint || 'To review'))),

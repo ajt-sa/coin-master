@@ -1,7 +1,7 @@
 // Transaction rows, detail sheet, the categorise sheet ("just this once" / "make it a rule")
 // and the rule editor. Shared by the dashboard, Update and Activity screens.
 import * as E from './engine.js';
-import { h, icon, chip, openSheet, closeAllSheets, toast, field, confirmSheet, shortDate } from './ui.js';
+import { h, icon, chip, openSheet, closeAllSheets, toast, field, confirmSheet, shortDate, empty } from './ui.js';
 import { app, isOwner, mutate, calc, undoLast } from './app.js';
 
 const fmt = E.fmt;
@@ -32,7 +32,7 @@ export function txnRow(t, { onclick, selectable = false, selected = false, onsel
     selectable ? h('input.sel', { type: 'checkbox', checked: selected, 'aria-label': 'Select', onchange: (e) => onselect && onselect(e.target.checked) }) : null,
     h('button.txrow-main', { type: 'button', onclick },
       h('span.tx-text',
-        h('span.tx-title', E.describeTxn(t)),
+        h('span.tx-title', E.describeTxn(t, app.state)),
         h('span.tx-meta', meta.join(' · ')),
         (t.rev || rebooked || t.note) ? h('span.tx-flags',
           t.rev ? h('span.flag.warn', icon('alert', 'sm'), t.dupOf ? 'Possible duplicate' : (t.hint || 'To review')) : null,
@@ -57,7 +57,9 @@ export function openTxn(id) {
     const editable = isOwner() && !t.arch;
     const rule = t.rule && app.state.rules.find(r => r.id === t.rule);
     const source = t.arch ? (t.man ? 'Coin Master: your category (read-only)' : 'Archive: sorted by the new rules, for reference') : t.man ? 'You decided' : rule ? `Rule: ${rule.name || 'unnamed'}` : t.rule === 'sys-loan' ? 'Loan convention ("Loan: …")' : t.auto ? 'Created automatically' : '—';
+    const renamed = typeof E.nameEntry === 'function' ? E.nameEntry(app.state, t) : null;
     const rows = [
+      renamed ? ['Bank name', t.cp || t.purpose] : null,
       ['Account', accountName(t.src)],
       ['Bank date', new Date(t.date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'long', year: 'numeric' })],
       editable && E.isCounted(t) ? null : ['Counts in', E.monthLabel(t.bm, true) + (t.bm !== E.ym(t.date) ? ' (re-booked)' : '')],
@@ -68,13 +70,15 @@ export function openTxn(id) {
       t.note ? ['Note', t.note] : null,
     ].filter(Boolean);
     sheet.set({
-      title: E.describeTxn(t),
+      title: E.describeTxn(t, app.state),
       subtitle: fmt(t.amt, { sign: true }),
       body: h('div.stack-sm',
         t.rev ? h('p.notice.warn', icon('alert', 'sm'), t.dupOf ? 'This looks like a duplicate of an earlier entry.' : (t.hint || 'Needs a look')) : null,
         editable && E.isCounted(t) ? h('div.chips', h('span.chips-label', 'Counts in'),
           liveMonthsAround(t.bm).map(mm => chip(E.monthLabel(mm), { on: mm === t.bm, onclick: () => { if (mm !== t.bm) mutate(s => E.decide(s, t.id, { bm: mm }), { label: `Now counts in ${E.monthLabel(mm, true)}` }); } }))) : null,
         h('dl.kv', rows.map(([k, v]) => [h('dt', k), h('dd', v)])),
+        isOwner() && typeof E.nameEntry === 'function' && (t.cp || t.purpose) ? h('button.link.small', { type: 'button', onclick: () => renameMerchant(t) },
+          icon('swap', 'sm'), renamed ? `Shown as “${renamed.name}” · change` : 'Rename merchant…') : null,
         t.dupOf ? dupBlock(t) : null,
       ),
       footer: editable ? [
@@ -194,13 +198,100 @@ export function openCategorize(ids, { onDone } = {}) {
         h('button.row-btn', { type: 'button', onclick: () => apply({ type: 'ignore' }, 'Ignored') }, h('span.grow', h('strong', 'Ignore'), h('span.muted.small.block', 'Leave out of every calculation (e.g. a bank notice).'))));
     }
     sheet.set({
-      title: single ? E.describeTxn(single) : `${txs.length} transactions`,
+      title: single ? E.describeTxn(single, app.state) : `${txs.length} transactions`,
       subtitle: single ? `${fmt(single.amt, { sign: true })} · ${accountName(single.src)} · ${shortDate(single.date)}` : `Together ${fmt(total, { sign: true })}`,
       body: h('div.stack-sm', single && single.purpose ? h('p.muted.small.clamp', single.purpose) : null, monthChips, typeChips, body),
     });
   };
   const bucketBtn = (id, idx) => h('button.bucket-btn', { type: 'button', class: single && single.cat === id ? 'on' : '', onclick: () => apply({ type: 'expense', cat: id }, `Filed to ${idx.get(id).name}`) }, idx.get(id).name);
   draw();
+}
+
+// ───────────────────────── merchant names ─────────────────────────
+
+const titleCase = (s) => String(s).toLowerCase().replace(/(^|[\s\-.&/])(\p{L})/gu, (m, a, b) => a + b.toUpperCase());
+
+/** From a transaction: change the name it already has, or start one from its bank name. */
+function renameMerchant(t) {
+  const e = E.nameEntry(app.state, t);
+  const entry = e && (app.state.names || []).find(n => n.id === e.id);
+  if (entry) { openNameEditor(entry); return; }
+  const key = E.nameKey(t.cp || t.purpose);
+  openNameEditor(null, { name: titleCase(key), match: [key] });
+}
+
+/** Settings → Merchant names. */
+export function openNames() {
+  const sheet = openSheet({ title: 'Merchant names', tall: true, body: () => '' });
+  const draw = () => {
+    const names = [...(app.state.names || [])].sort((a, b) => a.name.localeCompare(b.name));
+    sheet.set({
+      subtitle: 'One name per merchant, everywhere and on both phones',
+      body: h('div.stack-sm',
+        names.length ? h('ul.plain.months', names.map(n => {
+          const p = E.namePreview(app.state, n.match);
+          return h('li', h('button.row-btn', { type: 'button', onclick: () => openNameEditor(n) },
+            h('span.grow', h('strong', n.name), h('span.muted.small.block', `${n.match.join(' · ')} · ${p.count} transaction${p.count === 1 ? '' : 's'}`)),
+            icon('right', 'chev')));
+        })) : empty('No names yet', 'For example, show every Hofer branch as “Hofer”. You can also start from a transaction: Rename merchant.'),
+        h('p.muted.small', 'Only the name shown changes. The bank\'s own text stays underneath (visible in a transaction\'s details), so duplicates are still recognised and your rules keep working.')),
+      footer: [h('button.btn.primary', { type: 'button', onclick: () => openNameEditor(null) }, icon('plus', 'sm'), 'New name')],
+    });
+  };
+  draw();
+  app.redrawSheets.add(draw);
+  const close = sheet.close;
+  sheet.close = () => { app.redrawSheets.delete(draw); close(); };
+}
+
+/** Create or change one merchant name. preset: {name, match} when starting from a transaction. */
+export function openNameEditor(entry, preset = null) {
+  const st = { name: entry ? entry.name : (preset?.name || ''), match: entry ? [...entry.match] : [...(preset?.match || [])] };
+  const nameIn = h('input', { type: 'text', value: st.name, maxlength: 40, placeholder: 'e.g. Hofer', oninput: (e) => { st.name = e.target.value; drawPreview(); } });
+  const patIn = h('input', { type: 'text', placeholder: 'e.g. HOFER KG', autocapitalize: 'characters', autocomplete: 'off',
+    oninput: () => drawSuggest(), onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); addPat(patIn.value); } } });
+  const chipsHost = h('div.chips.wrap'), suggestHost = h('div'), previewHost = h('div');
+  const addPat = (p) => { const q = E.norm(p); if (q && !st.match.includes(q)) st.match.push(q); patIn.value = ''; drawAll(); };
+  const drawChips = () => chipsHost.replaceChildren(...(st.match.length
+    ? st.match.map(p => chip(`${p}  ✕`, { on: true, onclick: () => { st.match = st.match.filter(x => x !== p); drawAll(); } }))
+    : [h('span.muted.small', 'None yet: type one below')]));
+  const drawSuggest = () => {
+    const s = E.bankNames(app.state, patIn.value).filter(([k]) => !st.match.includes(k));
+    suggestHost.replaceChildren(s.length ? h('div.chips.wrap', h('span.chips-label', 'In your data'), s.map(([k, n]) => chip(`${k} · ${n}`, { onclick: () => addPat(k) }))) : '');
+  };
+  const drawPreview = () => {
+    const p = E.namePreview(app.state, st.match);
+    const shown = st.name.trim() || '…';
+    previewHost.replaceChildren(!st.match.length ? '' : h('div.stack-sm',
+      h('p', h('strong', `${p.count} transaction${p.count === 1 ? '' : 's'}`), ` will show as “${shown}”, including the Coin Master archive.`),
+      p.names.length ? h('p.muted.small', 'Bank names: ' + p.names.slice(0, 8).map(([k, n]) => `${k} (${n})`).join(' · ') + (p.names.length > 8 ? ` · and ${p.names.length - 8} more` : '')) : null));
+  };
+  const drawAll = () => { drawChips(); drawSuggest(); drawPreview(); };
+  drawAll();
+  const sheet = openSheet({
+    title: entry ? 'Change merchant name' : 'New merchant name', tall: true,
+    body: h('div.stack-sm',
+      field('Show as', nameIn),
+      h('p.label', 'Bank names it catches'), chipsHost,
+      h('div.inline', patIn, h('button.btn.small', { type: 'button', onclick: () => addPat(patIn.value) }, 'Add')),
+      h('p.muted.small', 'Whole words as the bank writes them: “HOFER” catches every Hofer branch; “SPAR” does not catch Interspar or Sparkasse. Add as many as you like.'),
+      suggestHost, previewHost),
+    footer: [
+      entry ? h('button.btn.ghost', { type: 'button', onclick: async () => {
+        if (!(await confirmSheet({ title: `Remove “${entry.name}”?`, message: 'These transactions show their bank names again.', confirm: 'Remove', danger: true }))) return;
+        sheet.close();
+        mutate(s => E.deleteName(s, entry.id), { label: `“${entry.name}” removed` });
+      } }, 'Remove') : null,
+      h('button.btn.primary', { type: 'button', onclick: () => {
+        if (patIn.value.trim()) addPat(patIn.value);
+        if (!st.name.trim()) { nameIn.focus(); toast('Type the name to show'); return; }
+        if (!st.match.length) { patIn.focus(); toast('Add at least one bank name'); return; }
+        sheet.close();
+        mutate(s => E.saveName(s, { id: entry?.id, name: st.name, match: st.match }), { label: `Now shown as “${st.name.trim()}”` });
+      } }, 'Save'),
+    ].filter(Boolean),
+  });
+  if (!entry && !preset) setTimeout(() => nameIn.focus(), 60);
 }
 
 // ───────────────────────── rule editor ─────────────────────────

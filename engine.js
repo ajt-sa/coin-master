@@ -1108,8 +1108,8 @@ export function newId(prefix = 'r') {
 }
 
 /** Suggest a rule from a manual decision: distinctive merchant words (+ purpose tag for own-account transfers). */
+const STOP = new Set(['AT', 'THE', 'DE', 'DER', 'DIE', 'UND', 'AND', 'GMBH', 'AG', 'KG', 'OG', 'SRL', 'S.R.L.', 'SPA', 'S.C.A.', 'LTD', 'INC', 'DANKT', 'DANKE', 'SAGT', 'FIL.', 'INKL.', 'NIEDERLASSUNG', 'EUROPE', 'PAYMENTS']);
 export function suggestRule(state, t, act) {
-  const STOP = new Set(['AT', 'THE', 'DE', 'DER', 'DIE', 'UND', 'AND', 'GMBH', 'AG', 'KG', 'OG', 'SRL', 'S.R.L.', 'SPA', 'S.C.A.', 'LTD', 'INC', 'DANKT', 'DANKE', 'SAGT', 'FIL.', 'INKL.', 'NIEDERLASSUNG', 'EUROPE', 'PAYMENTS']);
   const raw = norm(t.cp).split(' ').filter(w => w && !/\d/.test(w) && w.length > 1 && !STOP.has(w));
   const domain = raw.find(w => /\.[A-Z]{2,}$/.test(w));
   const words = domain ? [domain] : raw.filter(w => w.length > 2).slice(0, 2);
@@ -1162,8 +1162,100 @@ export function txnsForMonth(state, m) {
   return state.txns.filter(t => t.bm === m).sort((a, b) => b.date.localeCompare(a.date) || a.amt - b.amt);
 }
 
-export function describeTxn(t) {
-  return t.cp || t.purpose || '(no text)';
+/** The name shown for a transaction: your merchant name if one applies (pass state), else the bank's text. */
+export function describeTxn(t, state) {
+  return (state && displayName(state, t)) || t.cp || t.purpose || '(no text)';
+}
+
+// ───────────────────────── merchant names ─────────────────────────
+// One name for a merchant everywhere ("HOFER DANKT 0123", "HOFER KG" → "Hofer"), on both phones and
+// for every date, archive included. Only what is shown changes: the stored bank text, fingerprints
+// and rules stay exactly as the bank wrote them. state.names = [{ id, name, match: ['HOFER', …] }];
+// each entry is a whole word or phrase of the merchant text; the longest matching one wins.
+
+const bankText = (t) => norm(t.cp) || norm(t.purpose);
+
+let namesMemo = { sig: null, list: [] };
+function compiledNames(state) {
+  const names = (state && state.names) || [];
+  const sig = names.map(n => `${n.id}\u0001${n.name}\u0001${(n.match || []).join('\u0002')}`).join('\u0003');
+  if (sig !== namesMemo.sig) {
+    const list = [];
+    for (const n of names) for (const p of n.match || []) { const pat = norm(p); if (pat) list.push({ id: n.id, name: n.name, pat }); }
+    list.sort((a, b) => b.pat.length - a.pat.length); // most specific first; ties keep list order
+    namesMemo = { sig, list };
+  }
+  return namesMemo.list;
+}
+
+/** The merchant-name entry that applies to a transaction: {id, name} or null. */
+export function nameEntry(state, t) {
+  const list = compiledNames(state);
+  if (!list.length) return null;
+  const hay = bankText(t);
+  if (!hay) return null;
+  const hit = list.find(x => testText('word', hay, x.pat));
+  return hit ? { id: hit.id, name: hit.name } : null;
+}
+export function displayName(state, t) {
+  const e = nameEntry(state, t);
+  return e ? e.name : null;
+}
+
+/** "HOFER DANKT 0123" → "HOFER": the distinctive words of a bank name (no numbers, no "DANKT", "GMBH" …). */
+export function nameKey(text) {
+  const words = norm(text).split(' ').filter(w => w && !/\d/.test(w) && w.length > 1 && !STOP.has(w));
+  return words.length ? words.slice(0, 2).join(' ') : norm(text);
+}
+
+/** What a list of bank names would catch: how many transactions, and which bank texts (most frequent first). */
+export function namePreview(state, patterns) {
+  const pats = (patterns || []).map(norm).filter(Boolean);
+  const texts = new Map();
+  let count = 0;
+  if (!pats.length) return { count, names: [] };
+  for (const t of state.txns) {
+    const hay = bankText(t);
+    if (!hay || !pats.some(p => testText('word', hay, p))) continue;
+    count++;
+    const k = String(t.cp || t.purpose).trim();
+    texts.set(k, (texts.get(k) || 0) + 1);
+  }
+  return { count, names: [...texts].sort((a, b) => b[1] - a[1]) };
+}
+
+/** Bank names containing the typed text, as their distinctive words with a count (to pick from). */
+export function bankNames(state, query, limit = 6) {
+  const q = norm(query);
+  if (q.length < 2) return [];
+  const keys = new Map();
+  for (const t of state.txns) {
+    const hay = bankText(t);
+    if (!hay.includes(q)) continue;
+    const k = nameKey(hay);
+    keys.set(k, (keys.get(k) || 0) + 1);
+  }
+  return [...keys].sort((a, b) => b[1] - a[1]).slice(0, limit);
+}
+
+/** Add or change a merchant name ({id?, name, match[]}); returns the saved entry. */
+export function saveName(state, entry) {
+  const clean = {
+    id: entry.id || newId('n'),
+    name: String(entry.name || '').trim().slice(0, 40),
+    match: [...new Set((entry.match || []).map(norm).filter(Boolean))],
+  };
+  if (!clean.name || !clean.match.length) throw new Error('A name and at least one bank name are needed');
+  state.names = state.names || [];
+  const i = state.names.findIndex(n => n.id === clean.id);
+  if (i >= 0) state.names[i] = clean; else state.names.push(clean);
+  touch(state);
+  return clean;
+}
+
+export function deleteName(state, id) {
+  state.names = (state.names || []).filter(n => n.id !== id);
+  touch(state);
 }
 
 /** Running card bills: balance per card and what has been spent since the last settlement. */

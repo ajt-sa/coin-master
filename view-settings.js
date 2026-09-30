@@ -5,6 +5,7 @@ import { h, icon, chip, openSheet, toast, field, empty, confirmSheet, relTime, s
 import { app, isOwner, mutate, render, calc, publishNow, reloadRemote, forgetDevice, changePassphrase, replaceState, connectGitHub } from './app.js';
 import { openRuleEditor, describeRule, describeAction, txnRow, openTxn, accountName, catName } from './txn-ui.js';
 import * as VU from './view-update.js'; // namespace import: the invoice-dates sheet lives in Update
+import * as TU from './txn-ui.js'; // namespace import for screens added later (merchant names)
 
 const fmt = E.fmt;
 
@@ -14,6 +15,7 @@ export function renderSettings() {
   const rows = [
     ['wallet', 'Budget plan', 'Buckets and monthly amounts, from a chosen month on', openTemplate],
     ['rule', 'Rules', `${app.state.rules.filter(r => r.on !== false).length} active: how new transactions get filed`, openRules],
+    typeof TU.openNames === 'function' ? ['swap', 'Merchant names', (app.state.names || []).length ? `${app.state.names.length} renamed: one name per merchant` : 'Show a merchant under one name, e.g. all Hofer branches as “Hofer”', () => TU.openNames()] : null,
     ['tag', 'Loans & pending returns', loansOpen ? `${loansOpen} open` : 'None open', openLoans],
     ['bank', 'Accounts & balance check', 'Girokonto and cards, money-left breakdown', openAccounts],
     ['cloud', 'Sync & security', app.cfg.local ? 'Only on this phone: connect GitHub' : `${app.cfg.owner}/${app.cfg.repo}`, openSync],
@@ -21,7 +23,7 @@ export function renderSettings() {
     ['eye', 'How it works', 'The 2-minute monthly routine', openHelp],
   ];
   return h('div.stack',
-    h('section.card.menu', rows.map(([ic, title, sub, fn]) => h('button.row-btn', { type: 'button', onclick: fn }, icon(ic), h('span.grow', h('strong', title), h('span.muted.small.block', sub)), icon('right', 'chev')))),
+    h('section.card.menu', rows.filter(Boolean).map(([ic, title, sub, fn]) => h('button.row-btn', { type: 'button', onclick: fn }, icon(ic), h('span.grow', h('strong', title), h('span.muted.small.block', sub)), icon('right', 'chev')))),
     h('p.muted.small.center', `Coin Master · data rev ${app.state.meta?.rev || 0}`));
 }
 

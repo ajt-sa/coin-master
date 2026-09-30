@@ -1,6 +1,6 @@
 // Offline shell: app files are cached; the budget data itself always comes from GitHub
 // (the app keeps its own encrypted copy for offline viewing).
-const CACHE = 'coinmaster-1.0.1';
+const CACHE = 'coinmaster-1.0.2';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'engine.js', 'crypto.js', 'github.js', 'ui.js', 'charts.js',
   'txn-ui.js', 'view-budget.js', 'view-update.js', 'view-activity.js', 'view-settings.js', 'view-setup.js', 'xlsx-lite.js',
   'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];

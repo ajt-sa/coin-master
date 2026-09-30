@@ -4,6 +4,7 @@ import * as C from './crypto.js';
 import { h, icon, chip, openSheet, toast, field, empty, confirmSheet, relTime, segmented } from './ui.js';
 import { app, isOwner, mutate, render, calc, publishNow, reloadRemote, forgetDevice, changePassphrase, replaceState, connectGitHub } from './app.js';
 import { openRuleEditor, describeRule, describeAction, txnRow, openTxn, accountName, catName } from './txn-ui.js';
+import * as VU from './view-update.js'; // namespace import: the invoice-dates sheet lives in Update
 
 const fmt = E.fmt;
 
@@ -240,7 +241,7 @@ function openAccounts() {
             icon(a.kind === 'card' ? 'card' : 'bank'),
             h('span.grow', h('strong', a.name), h('span.muted.small.block',
               last ? `George ${fmt(last.bank)} on ${new Date(last.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}${Math.abs(last.diff) < 1 ? ' ✓' : ` (${fmt(last.diff, { sign: true })})`}` : 'not compared with George yet',
-              a.manual ? ' · added by hand' : '')),
+              a.manual ? ' · added by hand' : '', invoiceNote(a))),
             h('span.amt', fmt(rec.balances[a.id])));
         }),
         h('h3', 'Money left, from the balances'),
@@ -260,6 +261,13 @@ function openAccounts() {
   app.redrawSheets.add(draw);
 }
 
+/** " · invoice closed 26 Aug" for cards */
+function invoiceNote(a) {
+  if (a.kind !== 'card' || !a.invoices) return '';
+  const last = Object.entries(a.invoices).filter(([m, e]) => e.close && m >= app.state.settings.startMonth).sort().at(-1);
+  return last ? ` · invoice closed ${new Date(last[1].close + 'T12:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}` : '';
+}
+
 function editAccount(a) {
   const name = h('input', { type: 'text', value: a.name, maxlength: 40 });
   const anchor = h('input', { type: 'text', inputmode: 'decimal', value: ((a.anchor?.cents || 0) / 100).toFixed(2) });
@@ -271,6 +279,8 @@ function editAccount(a) {
       field('Name', name),
       field('File names contain', ids, 'Used to recognise which account an export belongs to (IBAN or last 4 card digits).'),
       a.kind === 'card' ? h('label.check', manual, 'No export for this card: I add its payments by hand (the card bill is then mirrored automatically)') : null,
+      a.kind === 'card' && typeof VU.openInvoiceDates === 'function' ? h('button.row-btn', { type: 'button', onclick: () => VU.openInvoiceDates(a.id) },
+        icon('calendar'), h('span.grow', h('strong', 'Invoice closing dates'), h('span.muted.small.block', 'Purchases after the closing day count in the next month')), icon('right', 'chev')) : null,
       h('details', h('summary', 'Start balance (advanced)'),
         field('Balance before the first imported transaction', anchor, 'Only change this if the balance check is off from the start.'))),
     footer: [h('button.btn.primary', { type: 'button', onclick: () => {
@@ -281,7 +291,7 @@ function editAccount(a) {
         x.name = name.value.trim() || x.name;
         x.ids = ids.value.split(',').map(v => v.trim()).filter(Boolean);
         if (x.kind === 'card') { if (manual.checked) x.manual = true; else delete x.manual; }
-        if (cents !== null && cents !== (x.anchor?.cents || 0)) x.anchor = { cents, note: `Changed by hand ${E.todayISO()}` };
+        if (cents !== null && cents !== (x.anchor?.cents || 0)) x.anchor = { ...(x.anchor || {}), cents, note: `Changed by hand ${E.todayISO()}` }; // keeps the start date
       }, { label: 'Account saved' });
     } }, 'Save')],
   });

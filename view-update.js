@@ -12,6 +12,7 @@ export function renderUpdate() {
   return h('div.stack',
     importCard(),
     app.lastImport ? summaryCard(app.lastImport) : null,
+    invoiceCard(),
     balanceCard(),
     reviewSection(q),
     historyCard());
@@ -48,9 +49,15 @@ async function runImport(fileList) {
     }
     if (files.length) {
       const plan = E.planImport(app.state, files);
+      // Card purchases late in a month need that month's invoice closing date: ask before filing them.
+      const questions = typeof E.invoiceQuestions === 'function' ? E.invoiceQuestions(app.state, { extra: plan.fresh, onlyExtra: true }) : [];
+      const dates = questions.length ? await askInvoiceDates(questions) : null;
       const batchId = E.newId('imp');
       let res;
-      mutate(s => { res = E.applyImport(s, plan, { batchId, ...track }); }, { label: null, message: `Import: ${plan.fresh.length} new` });
+      mutate(s => {
+        if (dates && dates.length) E.setInvoiceDates(s, dates);
+        res = E.applyImport(s, plan, { batchId, ...track });
+      }, { label: null, message: `Import: ${plan.fresh.length} new` });
       app.lastImport = { id: batchId, at: new Date().toISOString(), res: { added: res.added, known: res.known, review: res.review }, files: plan.files, problems };
       if (res.added) publishNow();
       window.scrollTo({ top: 0 });
@@ -154,6 +161,105 @@ function undoImportNow(batchId) {
   render();
   publishNow();
   toast(`Import undone: ${res.removed} transaction${res.removed === 1 ? '' : 's'} removed`, { actions: [['Undo', () => undoLast()]], ms: 8000 });
+}
+
+// ───────────────────────── card invoices ─────────────────────────
+
+const monthName = (m) => E.monthLabel(m, true).split(' ')[0];
+
+/**
+ * Ask for card invoice closing dates. items from E.invoiceQuestions / E.invoiceItems.
+ * prefill: start from the suggested date (during an update); otherwise only known dates are shown.
+ * Resolves the changes as [{acc, month, close} | {acc, month, open} | {acc, month}] or null ("Later").
+ */
+export function askInvoiceDates(items, { title = 'Card invoices', prefill = true } = {}) {
+  return new Promise(resolve => {
+    let done = false;
+    const today = E.todayISO();
+    const rows = items.map(it => {
+      const orig = { value: it.close || '', open: !it.close && !!it.open };
+      return { it, orig, value: orig.value || (prefill && !orig.open ? it.suggestion : ''), open: orig.open };
+    });
+    const itemView = (st) => {
+      const { it } = st;
+      const preview = h('p.muted.small');
+      const input = h('input', { type: 'date', value: st.value, min: `${it.month}-01`, max: `${it.month}-${String(E.daysInMonth(it.month)).padStart(2, '0')}`, disabled: st.open, 'aria-label': `${accountName(it.acc)} ${monthName(it.month)} invoice closed on`,
+        oninput: (e) => { st.value = e.target.value; update(); } });
+      const update = () => {
+        if (st.open) { preview.textContent = `Everything so far counts in ${monthName(it.month)}.`; return; }
+        if (!st.value) { preview.textContent = 'No date yet: purchases count in the month of their date.'; return; }
+        if (st.value.slice(0, 7) !== it.month) { preview.textContent = `Pick a day in ${E.monthLabel(it.month, true)}.`; return; }
+        const after = it.rows.filter(r => r.date > st.value);
+        preview.textContent = after.length
+          ? `${after.length} purchase${after.length === 1 ? '' : 's'} after that day (${fmt(-after.reduce((a, r) => a + r.amt, 0))}) count in ${monthName(E.addMonths(it.month, 1))}.`
+          : `All of ${monthName(it.month)}'s purchases so far are on this invoice.`;
+      };
+      update();
+      const hint = it.basis === 'bill' ? `Suggested ${shortDate(it.suggestion)}: matches the bill of ${fmt(it.bill)}`
+        : it.basis === 'last' ? `Suggested ${shortDate(it.suggestion)}: same day as last month` : `Suggested ${shortDate(it.suggestion)}`;
+      return h('div.stack-sm',
+        h('h3', `${accountName(it.acc)} · ${monthName(it.month)} invoice`),
+        field('Closed on', input, it.close ? null : hint),
+        it.canBeOpen ? h('label.check', h('input', { type: 'checkbox', checked: st.open, onchange: (e) => { st.open = e.target.checked; input.disabled = st.open; update(); } }), 'Not closed yet') : null,
+        preview);
+    };
+    const sheet = openSheet({
+      title, subtitle: 'When did they close?', tall: items.length > 2,
+      body: h('div.stack',
+        h('p.muted.small', 'The closing date is on the card invoice in George. Purchases up to and including that day count in that month; later ones count in the next month.'),
+        rows.map(itemView)),
+      footer: [
+        h('button.btn.ghost', { type: 'button', onclick: () => { done = true; sheet.close(); resolve(null); } }, prefill ? 'Later' : 'Cancel'),
+        h('button.btn.primary', { type: 'button', onclick: () => {
+          const bad = rows.find(st => !st.open && st.value && st.value.slice(0, 7) !== st.it.month);
+          if (bad) { toast(`Pick a day in ${E.monthLabel(bad.it.month, true)} for the ${accountName(bad.it.acc)} invoice`, { kind: 'warn' }); return; }
+          const out = [];
+          for (const st of rows) {
+            const { it, orig } = st;
+            if (st.open) { out.push({ acc: it.acc, month: it.month, open: today }); continue; }
+            if (st.value && st.value !== orig.value) out.push({ acc: it.acc, month: it.month, close: st.value });
+            else if (!st.value && (orig.value || orig.open)) out.push({ acc: it.acc, month: it.month });
+          }
+          done = true; sheet.close(); resolve(out);
+        } }, 'Save'),
+      ],
+      onClose: () => { if (!done) resolve(null); },
+    });
+  });
+}
+
+/** Settings → Accounts → card: every invoice month so far. */
+export function openInvoiceDates(accId) {
+  return askInvoiceDates(E.invoiceItems(app.state, accId), { title: `${accountName(accId)} invoices`, prefill: false }).then(saveInvoiceDates);
+}
+
+function saveInvoiceDates(entries) {
+  if (!entries || !entries.length) return;
+  let moved = 0;
+  mutate(s => { moved = E.setInvoiceDates(s, entries); }, { label: null, message: 'Card invoice dates' });
+  toast(moved ? `Saved · ${moved} card purchase${moved === 1 ? '' : 's'} moved to ${moved === 1 ? 'its' : 'their'} invoice month` : 'Closing dates saved',
+    { actions: [['Undo', () => undoLast()]], ms: 6000 });
+}
+
+/** Missing closing dates, and invoices whose purchases do not add up to the bill. */
+function invoiceCard() {
+  if (typeof E.invoiceQuestions !== 'function') return null;
+  const q = E.invoiceQuestions(app.state);
+  const off = E.invoiceChecks(app.state).filter(x => !x.ok);
+  if (!q.length && !off.length) return null;
+  return h('section.card',
+    h('div.section-head', h('h2', 'Card invoices'), h('span.muted.small', 'closing dates')),
+    q.length ? [
+      h('p', `Closing date missing: ${q.map(x => `${accountName(x.acc)} ${monthName(x.month)}`).join(', ')}.`),
+      h('p.muted.small', 'Until then, late-month card purchases count in the month of their date.'),
+      h('button.btn.primary.wide', { type: 'button', onclick: () => askInvoiceDates(q).then(saveInvoiceDates) }, 'Enter closing dates'),
+    ] : null,
+    off.map(x => h('div.stack-sm',
+      h('p.notice.warn', icon('alert', 'sm'), `${accountName(x.acc)} ${monthName(x.month)} invoice: the bill is ${fmt(x.bill)}, but the purchases up to ${shortDate(x.close)} add up to ${fmt(x.sum)}.`),
+      x.fix ? null : h('p.muted.small', 'No closing date makes them match: a purchase may be missing or doubled.'),
+      h('div.btn-row',
+        x.fix ? h('button.btn.small.primary', { type: 'button', onclick: () => saveInvoiceDates([{ acc: x.acc, month: x.month, close: x.fix }]) }, `Use ${shortDate(x.fix)}`) : null,
+        h('button.btn.small.ghost', { type: 'button', onclick: () => askInvoiceDates(E.invoiceItems(app.state, x.acc).filter(i => i.month === x.month), { prefill: false }).then(saveInvoiceDates) }, 'Change date')))));
 }
 
 // ───────────────────────── balance check ─────────────────────────

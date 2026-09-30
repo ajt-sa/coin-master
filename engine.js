@@ -218,14 +218,17 @@ export function bookingMonth(state, t, policy = 'date') {
   const s = state.settings || {};
   const salaryDay = s.salaryDay || 15;
   const tag = s.monthTags === false ? null : monthTag(t);
+  // Card purchases count in the month of the invoice they are on (see "card invoices").
+  const card = cardAccount(state, t.src);
+  const base = card ? invoiceMonth(card, t.date) : ym(t.date);
   let m;
   if (policy === 'salary') {
     if (tag) m = addMonths(tag, 1);
     else m = Number(t.date.slice(8, 10)) >= salaryDay ? addMonths(ym(t.date), 1) : ym(t.date);
   } else if (policy === 'next') {
-    m = addMonths(tag || ym(t.date), 1);
+    m = addMonths(tag || base, 1);
   } else {
-    m = tag || ym(t.date);
+    m = tag || base;
   }
   return clampToLive(state, m);
 }
@@ -233,6 +236,205 @@ export function bookingMonth(state, t, policy = 'date') {
 export function clampToLive(state, m) {
   const start = state.settings.startMonth;
   return m < start ? start : m;
+}
+
+// ───────────────────────── card invoices ─────────────────────────
+// A card purchase counts in the month of the invoice it is on (as in Coin Master): every card has
+// a closing date per month, entered during the update. Purchases up to and including that day
+// belong to that month's invoice, later ones to the next. acc.invoices = { 'YYYY-MM': { close } }
+// or { open } ("not closed yet" as of that day). Without a date, a purchase counts in its own month.
+
+export function cardAccount(state, id) {
+  const a = (state.accounts || []).find(x => x.id === id);
+  return a && a.kind === 'card' ? a : null;
+}
+
+/** Invoice month of a card purchase dated `date`. */
+export function invoiceMonth(acc, date) {
+  const M = ym(date);
+  const e = acc && acc.invoices && acc.invoices[M];
+  return e && e.close && date > e.close ? addMonths(M, 1) : M;
+}
+
+/** Closing dates of a card, including the Coin Master start (the last statement before the app took over). */
+function invoicesOf(acc) {
+  const inv = { ...(acc.invoices || {}) };
+  if (acc.anchor && acc.anchor.date && !inv[ym(acc.anchor.date)]) inv[ym(acc.anchor.date)] = { close: acc.anchor.date };
+  return inv;
+}
+
+/** Card rows that make up an invoice: purchases and refunds, not the monthly payment to the card. */
+const onInvoice = (t) => !t.arch && !t.auto && t.type !== 'settle';
+
+const BILL_RE = /KREDITKARTENRECHNUNG\s+([A-Z]+)\.?\s*(\d{4})/;
+/** "s Kreditkartenrechnung Aug. 2026 … Kartenendnummer 1234" → '2026-08' */
+export function billMonth(t) {
+  const m = norm(t.purpose).match(BILL_RE) || norm(t.cp).match(BILL_RE);
+  if (!m) return null;
+  const idx = MONTH_WORDS.findIndex(w => w.includes(m[1]));
+  return idx < 0 ? null : `${m[2]}-${String(idx + 1).padStart(2, '0')}`;
+}
+
+/** The current-account debit that paid this card's invoice for month M (extra: rows about to be imported). */
+export function cardBill(state, acc, M, extra = []) {
+  const isBill = (t) => t.amt < 0 && accountKind(state, t.src) === 'giro' && billMonth(t) === M && (settlementCard(state, t) || {}).id === acc.id;
+  return state.txns.find(isBill) || extra.find(isBill) || null;
+}
+
+const monthEnd = (M) => `${M}-${String(daysInMonth(M)).padStart(2, '0')}`;
+const dayOf = (iso) => Number(iso.slice(8, 10));
+const onDay = (M, day) => `${M}-${String(Math.min(day, daysInMonth(M))).padStart(2, '0')}`;
+
+/** From which day of the month a card's closing date matters (the 20th, earlier if it ever closed earlier). */
+function windowDay(acc) {
+  const days = Object.values(invoicesOf(acc)).filter(e => e.close).map(e => dayOf(e.close) - 2);
+  return Math.min(20, ...days);
+}
+
+/**
+ * The closing day at which the purchases since the previous invoice add up to the bill. Days without
+ * purchases are equivalent; the one nearest the card's usual closing day is returned.
+ */
+function matchClose(rows, prevClose, M, billCents) {
+  const list = rows.filter(t => t.date > prevClose).sort((a, b) => a.date.localeCompare(b.date));
+  const end = monthEnd(M);
+  let sum = 0, i = 0;
+  for (let d = `${M}-01`; d <= end; d = addDays(d, 1)) {
+    while (i < list.length && list[i].date <= d) { sum += list[i].amt; i++; }
+    if (-sum !== billCents) continue;
+    const next = i < list.length ? list[i].date : null;
+    let hi = d;
+    while (hi < end && !(next && addDays(hi, 1) >= next)) hi = addDays(hi, 1);
+    const want = onDay(M, dayOf(prevClose));
+    return want < d ? d : want > hi ? hi : want;
+  }
+  return null;
+}
+
+/** Suggested closing date for a card's invoice of month M: from the bill if it is there, else last month's day. */
+function suggestClose(state, acc, M, rows, extra = []) {
+  const inv = invoicesOf(acc);
+  const bill = cardBill(state, acc, M, extra);
+  const prev = inv[addMonths(M, -1)];
+  if (bill && prev && prev.close) {
+    const d = matchClose(rows, prev.close, M, -bill.amt);
+    if (d) return { suggestion: d, basis: 'bill', bill: -bill.amt };
+  }
+  const known = Object.keys(inv).filter(m => m < M && inv[m].close).sort();
+  const day = known.length ? dayOf(inv[known.at(-1)].close) : 25;
+  return { suggestion: onDay(M, day), basis: known.length ? 'last' : 'default', bill: bill ? -bill.amt : null };
+}
+
+function invoiceRows(state, acc, extra = []) {
+  const fresh = extra.filter(x => x.src === acc.id).map(x => ({ ...x, type: x.type || categorize(state, x).type }));
+  return state.txns.filter(t => t.src === acc.id && onInvoice(t)).concat(fresh.filter(onInvoice));
+}
+
+function invoiceItem(state, acc, M, rows, today, extra = []) {
+  const e = (acc.invoices || {})[M] || {};
+  return {
+    acc: acc.id, month: M, close: e.close || null, open: e.open || null, canBeOpen: M === ym(today),
+    rows: rows.filter(t => ym(t.date) === M).map(t => ({ date: t.date, amt: t.amt })),
+    ...suggestClose(state, acc, M, rows, extra),
+  };
+}
+
+/**
+ * Card invoices whose closing date is needed: purchases from about the 20th of a month on, no
+ * closing date for that month yet, and not already confirmed "not closed yet" for those days.
+ * extra: rows about to be imported, so the question comes before they are filed;
+ * onlyExtra: ask only about months those rows reach (the Update screen reminds about the rest).
+ */
+export function invoiceQuestions(state, { today = todayISO(), extra = [], onlyExtra = false } = {}) {
+  const out = [];
+  const start = state.settings.startMonth;
+  for (const acc of state.accounts.filter(a => a.kind === 'card')) {
+    const rows = invoiceRows(state, acc, extra);
+    const wd = windowDay(acc);
+    const months = new Set();
+    const candidates = onlyExtra ? invoiceRows({ ...state, txns: [] }, acc, extra) : rows;
+    for (const t of candidates) {
+      const M = ym(t.date);
+      if (M < start || dayOf(t.date) < wd) continue;
+      const e = (acc.invoices || {})[M];
+      if (e && (e.close || (e.open && t.date <= e.open))) continue;
+      months.add(M);
+    }
+    for (const M of [...months].sort()) out.push(invoiceItem(state, acc, M, rows, today, extra));
+  }
+  return out;
+}
+
+/** All invoice months of one card from the first live month to today (Settings). */
+export function invoiceItems(state, accId, today = todayISO()) {
+  const acc = cardAccount(state, accId);
+  if (!acc) return [];
+  const rows = invoiceRows(state, acc);
+  return monthsBetween(state.settings.startMonth, ym(today)).reverse().map(M => invoiceItem(state, acc, M, rows, today));
+}
+
+/** Invoices with a closing date and a bill on the current account: do the purchases add up to the bill? */
+export function invoiceChecks(state) {
+  const out = [];
+  for (const acc of state.accounts.filter(a => a.kind === 'card')) {
+    const inv = invoicesOf(acc);
+    const rows = invoiceRows(state, acc);
+    for (const M of Object.keys(inv).sort()) {
+      const e = inv[M], prev = inv[addMonths(M, -1)];
+      if (!e.close || M < state.settings.startMonth || !prev || !prev.close) continue;
+      const bill = cardBill(state, acc, M);
+      if (!bill) continue;
+      const sum = -rows.filter(t => t.date > prev.close && t.date <= e.close).reduce((s, t) => s + t.amt, 0);
+      const fix = sum === -bill.amt ? null : matchClose(rows, prev.close, M, -bill.amt);
+      out.push({ acc: acc.id, month: M, close: e.close, bill: -bill.amt, sum, ok: sum === -bill.amt, fix: fix && fix !== e.close ? fix : null });
+    }
+  }
+  return out;
+}
+
+const policyOf = (state, t) => { const r = t.rule && state.rules.find(x => x.id === t.rule); return (r && r.act && r.act.bm) || 'date'; };
+
+/** Give card purchases the month of their invoice again (loans and months chosen by hand stay). */
+function resortCards(state, accIds) {
+  let moved = 0;
+  for (const t of state.txns) {
+    if (!accIds.has(t.src) || t.arch || t.a || t.bmMan || t.type === 'loan' || t.type === 'settle') continue;
+    const m = bookingMonth(state, t, policyOf(state, t));
+    if (m !== t.bm) { t.bm = m; if (isCounted(t)) moved++; }
+  }
+  return moved;
+}
+
+/** First use: keep months already moved by hand, and start from the Coin Master statements. */
+export function ensureInvoices(state) {
+  if (state.settings.invoices) return;
+  for (const t of state.txns) {
+    if (!cardAccount(state, t.src) || t.arch || t.a || t.bmMan || t.type === 'loan' || t.type === 'settle') continue;
+    if (t.bm && t.bm !== bookingMonth(state, t, policyOf(state, t))) t.bmMan = 1;
+  }
+  for (const acc of state.accounts.filter(a => a.kind === 'card')) acc.invoices = invoicesOf(acc);
+  state.settings.invoices = 1;
+}
+
+/**
+ * Save closing dates: [{acc, month, close}] | [{acc, month, open}] ("not closed yet" as of that day)
+ * | [{acc, month}] (forget). Card purchases move to their invoice month; returns how many moved.
+ */
+export function setInvoiceDates(state, entries) {
+  ensureInvoices(state);
+  const touched = new Set();
+  for (const x of entries) {
+    const acc = cardAccount(state, x.acc);
+    if (!acc || !/^\d{4}-\d{2}$/.test(x.month || '')) continue;
+    acc.invoices = acc.invoices || {};
+    if (x.close && x.close.slice(0, 7) === x.month) acc.invoices[x.month] = { close: x.close };
+    else if (x.open) acc.invoices[x.month] = { open: x.open };
+    else delete acc.invoices[x.month];
+    touched.add(acc.id);
+  }
+  const moved = resortCards(state, touched);
+  touch(state);
+  return moved;
 }
 
 // ───────────────────────── rules ─────────────────────────
@@ -495,6 +697,7 @@ function fileNew(state, t, rules) {
  * (so undoing the import can forget them too).
  */
 export function applyImport(state, plan, { batchId, at = new Date().toISOString(), skip = new Set(), learned = [], newAccts = [] } = {}) {
+  ensureInvoices(state);
   const rules = sortedRules(state);
   const added = [];
   for (const n of plan.fresh) {
@@ -880,6 +1083,7 @@ export function decide(state, id, changes) {
   if (!t) throw new Error('Unknown transaction ' + id);
   if (t.arch) throw new Error('Archived Coin Master months are read-only');
   for (const k of ['type', 'cat', 'bm', 'tag', 'note', 'loan']) if (k in changes) t[k] = changes[k];
+  if ('bm' in changes) t.bmMan = 1; // a month chosen by hand stays when invoice dates change
   if (t.type !== 'expense' && t.type !== 'income') t.cat = null;
   if (t.type !== 'oneoff' && t.type !== 'loan' && !('tag' in changes)) delete t.tag;
   if (t.bm) t.bm = clampToLive(state, t.bm);

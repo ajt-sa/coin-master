@@ -24,6 +24,11 @@ export function describeCategory(t) {
   return TYPE_LABEL[t.type] || t.type;
 }
 
+/** The purpose line as shown: with your merchant name in place of the bank's. */
+export function shownPurpose(t) {
+  return typeof E.shownText === 'function' ? E.shownText(app.state, t, t.purpose) : t.purpose;
+}
+
 export function txnRow(t, { onclick, selectable = false, selected = false, onselect } = {}) {
   const dateMonth = E.ym(t.date);
   const rebooked = t.bm && dateMonth !== t.bm;
@@ -58,14 +63,15 @@ export function openTxn(id) {
     const rule = t.rule && app.state.rules.find(r => r.id === t.rule);
     const source = t.arch ? (t.man ? 'Coin Master: your category (read-only)' : 'Archive: sorted by the new rules, for reference') : t.man ? 'You decided' : rule ? `Rule: ${rule.name || 'unnamed'}` : t.rule === 'sys-loan' ? 'Loan convention ("Loan: …")' : t.auto ? 'Created automatically' : '—';
     const renamed = typeof E.nameEntry === 'function' ? E.nameEntry(app.state, t) : null;
+    const shown = (text) => (renamed && typeof E.shownText === 'function' ? E.shownText(app.state, t, text) : text); // your merchant name in bank texts
     const rows = [
-      renamed ? ['Bank name', t.cp || t.purpose] : null,
+      renamed ? ['Bank name', renamed.name] : null,
       ['Account', accountName(t.src)],
       ['Bank date', new Date(t.date + 'T12:00:00').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'long', year: 'numeric' })],
       editable && E.isCounted(t) ? null : ['Counts in', E.monthLabel(t.bm, true) + (t.bm !== E.ym(t.date) ? ' (re-booked)' : '')],
       ['Category', describeCategory(t)],
-      ['Filed by', source],
-      t.purpose ? ['Purpose', t.purpose] : null,
+      ['Filed by', shown(source)],
+      t.purpose ? ['Purpose', shown(t.purpose)] : null,
       t.iban || t.acct ? ['Partner account', [t.iban, t.acct].filter(Boolean).join(' · ')] : null,
       t.note ? ['Note', t.note] : null,
     ].filter(Boolean);
@@ -200,7 +206,7 @@ export function openCategorize(ids, { onDone } = {}) {
     sheet.set({
       title: single ? E.describeTxn(single, app.state) : `${txs.length} transactions`,
       subtitle: single ? `${fmt(single.amt, { sign: true })} · ${accountName(single.src)} · ${shortDate(single.date)}` : `Together ${fmt(total, { sign: true })}`,
-      body: h('div.stack-sm', single && single.purpose ? h('p.muted.small.clamp', single.purpose) : null, monthChips, typeChips, body),
+      body: h('div.stack-sm', single && single.purpose ? h('p.muted.small.clamp', shownPurpose(single)) : null, monthChips, typeChips, body),
     });
   };
   const bucketBtn = (id, idx) => h('button.bucket-btn', { type: 'button', class: single && single.cat === id ? 'on' : '', onclick: () => apply({ type: 'expense', cat: id }, `Filed to ${idx.get(id).name}`) }, idx.get(id).name);
@@ -234,7 +240,7 @@ export function openNames() {
             h('span.grow', h('strong', n.name), h('span.muted.small.block', `${n.match.join(' · ')} · ${p.count} transaction${p.count === 1 ? '' : 's'}`)),
             icon('right', 'chev')));
         })) : empty('No names yet', 'For example, show every Hofer branch as “Hofer”. You can also start from a transaction: Rename merchant.'),
-        h('p.muted.small', 'Only the name shown changes. The bank\'s own text stays underneath (visible in a transaction\'s details), so duplicates are still recognised and your rules keep working.')),
+        h('p.muted.small', 'Your name replaces the bank\'s everywhere you look, details included. The app keeps the bank\'s own text in the background (shown only on this screen), so duplicates are still recognised and your rules keep working.')),
       footer: [h('button.btn.primary', { type: 'button', onclick: () => openNameEditor(null) }, icon('plus', 'sm'), 'New name')],
     });
   };
@@ -395,7 +401,7 @@ export function openRuleEditor(rule, { isNew = false, fromTxn = null } = {}) {
     const onOff = h('input', { type: 'checkbox', checked: r.on !== false, onchange: (e) => { r.on = e.target.checked; } });
     sheet.set({
       title: isNew ? 'New rule' : (r.name || 'Edit rule'),
-      subtitle: fromTxn ? `From: ${E.describeTxn(fromTxn)}` : r.note || null,
+      subtitle: fromTxn ? `From: ${E.describeTxn(fromTxn, app.state)}` : r.note || null,
       body: h('div.stack-sm',
         field('Name', name),
         h('p.label', 'When all of these match'),

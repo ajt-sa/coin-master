@@ -409,7 +409,7 @@ function reviewItem(t, selecting, sel) {
     h('button.ritem-main', { type: 'button', onclick: () => selecting ? (sel.has(t.id) ? sel.delete(t.id) : sel.add(t.id), render()) : openTxn(t.id) },
       h('span.ritem-top', h('span.tx-title', E.describeTxn(t, app.state)), h('span.tx-amt', { class: t.amt > 0 ? 'pos' : '' }, fmt(t.amt, { sign: true }))),
       h('span.tx-meta', `${accountName(t.src)} · ${shortDate(t.date)}${t.bm !== E.ym(t.date) ? ` · counts in ${E.monthLabel(t.bm)}` : ''}`),
-      t.purpose ? h('span.tx-purpose', t.purpose) : null,
+      t.purpose ? h('span.tx-purpose', typeof E.shownText === 'function' ? E.shownText(app.state, t, t.purpose) : t.purpose) : null,
       h('span.flag.warn', icon('alert', 'sm'), t.dupOf ? 'Same amount and date as an earlier entry' : (t.hint || 'To review'))),
     selecting ? null : h('div.ritem-actions',
       t.pre ? h('button.btn.small', { type: 'button', onclick: () => mutate(s => E.dropDuplicate(s, t.id), { label: 'Removed' }) }, 'Remove') : null,

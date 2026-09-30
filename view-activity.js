@@ -19,8 +19,10 @@ function matches(t, filter, q) {
   if (filter.startsWith('src:') && t.src !== filter.slice(4)) return false;
   if (filter.startsWith('cat:') && t.cat !== filter.slice(4)) return false;
   if (q) {
-    const shownAs = typeof E.displayName === 'function' ? E.displayName(app.state, t) || '' : '';
-    const hay = E.norm(`${shownAs} ${t.cp} ${t.purpose} ${t.note || ''} ${t.tag || ''} ${(t.amt / 100).toFixed(2)} ${fmt(t.amt)}`);
+    // search what is shown: a renamed merchant is found by its new name, not the bank's
+    const named = typeof E.displayName === 'function' && E.displayName(app.state, t);
+    const text = named ? `${named} ${E.shownText(app.state, t, t.purpose)}` : `${t.cp} ${t.purpose}`;
+    const hay = E.norm(`${text} ${t.note || ''} ${t.tag || ''} ${(t.amt / 100).toFixed(2)} ${fmt(t.amt)}`);
     if (!E.norm(q).split(' ').every(w => hay.includes(w))) return false;
   }
   return true;

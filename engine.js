@@ -1202,6 +1202,27 @@ export function displayName(state, t) {
   return e ? e.name : null;
 }
 
+/** A normalised name ("OEBB SAGT DANKE") as a pattern that also matches the bank's spelling ("ÖBB sagt Danke"). */
+function spelledSource(p) {
+  return norm(p).split(' ').map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/AE/g, '(?:AE|Ä)').replace(/OE/g, '(?:OE|Ö)').replace(/UE/g, '(?:UE|Ü)').replace(/SS/g, '(?:SS|ß)')).join('\\s+');
+}
+
+/**
+ * A bank text as shown (purpose line, "filed by" …): your merchant name wherever the bank's name
+ * appears in it, e.g. "HOFER DANKT 2361 K1 03.07." → "Hofer 2361 K1 03.07.". One pass, whole words.
+ */
+export function shownText(state, t, text) {
+  if (!text) return text || '';
+  const e = nameEntry(state, t);
+  if (!e) return text;
+  const entry = (state.names || []).find(n => n.id === e.id);
+  const alts = [...new Set([norm(t.cp), ...((entry && entry.match) || [])].filter(Boolean))]
+    .sort((a, b) => b.length - a.length).map(spelledSource);
+  const re = new RegExp(`(^|[^\\p{L}\\p{N}])(?:${alts.join('|')})(?=$|[^\\p{L}\\p{N}])`, 'giu');
+  return String(text).replace(re, (m, pre) => pre + e.name);
+}
+
 /** "HOFER DANKT 0123" → "HOFER": the distinctive words of a bank name (no numbers, no "DANKT", "GMBH" …). */
 export function nameKey(text) {
   const words = norm(text).split(' ').filter(w => w && !/\d/.test(w) && w.length > 1 && !STOP.has(w));
